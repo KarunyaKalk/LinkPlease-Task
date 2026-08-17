@@ -4,8 +4,11 @@ import json
 import time
 import httpx
 
-BASE_URL = "http://127.0.0.1:8000"
+import sys
+
+BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "https://linkplease-task.onrender.com"
 SECRET = "pseudogram_secret_key"
+
 
 def send_signed_webhook(event_type: str, data: dict):
     payload = {
