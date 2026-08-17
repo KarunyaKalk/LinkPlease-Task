@@ -23,3 +23,18 @@ app = FastAPI(title="Instagram Automation Backend", lifespan=lifespan)
 app.include_router(rules.router)
 app.include_router(webhook.router)
 app.include_router(stats.router)
+
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "Instagram Automation Backend",
+        "endpoints": {
+            "stats": "/stats",
+            "rules": "/rules",
+            "webhook": "/webhook",
+            "docs": "/docs"
+        }
+    }
+
