@@ -27,9 +27,10 @@ app.include_router(stats.router)
 
 @app.get("/")
 async def root():
+    stats_data = await get_stats()
     return {
         "status": "online",
-        "service": "Instagram Automation Backend",
+        "stats": stats_data,
         "endpoints": {
             "stats": "/stats",
             "rules": "/rules",
@@ -37,4 +38,5 @@ async def root():
             "docs": "/docs"
         }
     }
+
 
