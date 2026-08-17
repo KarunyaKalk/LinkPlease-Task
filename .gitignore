@@ -1,7 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Environment variables
+.env
+
+# SQLite databases & database state
 *.db
 *.db-shm
 *.db-wal
-__pycache__/
-*.pyc
+*.db-journal
+app.db
+
+# Pytest / Cache
 .pytest_cache/
-venv/
+.coverage
+htmlcov/
+
+# macOS / OS generated files
+.DS_Store
+.AppleDouble
+.LSOverride

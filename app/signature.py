@@ -1,13 +1,13 @@
-from __future__ import annotations
-
 import hmac
 import hashlib
+import os
+
+API_KEY = os.getenv("PSEUDOGRAM_API_KEY", "pseudogram_secret_key")
 
 
-def verify_signature(raw_body: bytes, header_value: str | None, secret: str) -> bool:
-    if not header_value or not header_value.startswith("sha256="):
+def verify_signature(raw_body: bytes, signature_header: str, secret: str = API_KEY) -> bool:
+    if not signature_header or not signature_header.startswith("sha256="):
         return False
-    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    provided = header_value[len("sha256="):]
-    # compare_digest, not ==, so this isn't a timing side-channel on the signature
-    return hmac.compare_digest(expected, provided)
+    expected_hex = signature_header.split("sha256=", 1)[1]
+    computed_hex = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed_hex, expected_hex)

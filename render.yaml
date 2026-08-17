@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: instagram-automation-backend
+    runtime: docker
+    repo: https://github.com/your-username/your-repo # Replace with your GitHub repository URL if deploying via Blueprint
+    plan: starter
+    healthCheckPath: /stats
+    envVars:
+      - key: DB_PATH
+        value: /data/app.db
+      - key: PSEUDOGRAM_API_URL
+        value: https://pseudogram-api.onrender.com
+      - key: PSEUDOGRAM_API_KEY
+        value: pseudogram_secret_key
+    disk:
+      name: sqlite-data
+      mountPath: /data
+      sizeGB: 1

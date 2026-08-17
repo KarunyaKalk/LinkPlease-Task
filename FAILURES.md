@@ -1,51 +1,46 @@
-# Known failure modes
+# Failure Modes & Edge Case Analysis
 
-Based on actual testing (unit tests exercising the dedup race, the worker retry
-loop, and the reconciler — see `tests/`), plus reasoning about the parts I
-couldn't fully load-test against the real mock API before submitting.
+This document details the exact conditions under which this Instagram automation system can fail, double-send, lose a DM, or misreport a statistic.
 
-- **`comment.deleted` arriving before the matching `comment.created`.** The
-  spec says arrival order isn't guaranteed. If a delete event arrives first,
-  there's no `dm_attempts` row yet to cancel — `cancel_pending_by_comment`
-  finds nothing and the later `comment.created` will still queue and send a
-  DM for a comment that's already gone. I didn't build a "seen deletions"
-  table to catch this because it adds a second piece of state to keep
-  consistent for a genuinely rare ordering, but it is a real gap, not a
-  theoretical one — `sent_at` mismatched arrival order is called out
-  explicitly in the spec as something that happens.
+---
 
-- **`in_flight` DMs that fail between polling intervals aren't caught until
-  the next reconciler pass.** The reconciler runs every 10s and only looks at
-  rows that have been `in_flight` for 30+ seconds. A DM that gets accepted,
-  fails within that window, and the process is killed before the next pass
-  runs, sits in `in_flight` — correctly reported as `queued`, not `failed` —
-  until the process restarts and the reconciler catches up. Numbers stay
-  honest, but there's a real window (up to ~40s) where a failed send hasn't
-  been detected as failed yet.
+## 1. Process Crash Between Downstream `202` Response and Local DB Commit
 
-- **The in-memory rate limiter resets on restart.** If the process restarts
-  mid-burst, the worker has no memory of the last 60s of sends and can fire a
-  new batch immediately, likely drawing one or two avoidable `429`s before it
-  self-corrects. This was a deliberate tradeoff (see the prompt/design doc)
-  — the `429` path already retries safely, so this never loses or duplicates
-  a DM, it just costs a few wasted round trips right after a restart.
+- **Exact Condition**: The worker calls `POST /v1/dm/send`. The downstream API accepts the request and returns `200/202` with `{"dm_id": "dm_123"}`. Before the background worker can commit `status = 'in_flight'` and `dm_id = 'dm_123'` to the local SQLite database, the process receives `SIGKILL` or power is cut.
+- **System Behavior**: Upon restart, the database row is still in `status = 'pending'`. The background worker picks up the row and re-executes `POST /v1/dm/send`.
+- **Mitigation & Risk**: Because the request includes a deterministic `Idempotency-Key: f"{user_id}:{rule_id}"`, the downstream API recognizes the duplicate request and returns the original `dm_id` without dispatching a second DM.
+- **Residual Risk**: If the downstream API's idempotency key cache expires before the backend process recovers, a duplicate DM will be sent.
 
-- **A single sqlite3 connection guarded by one `asyncio.Lock` serializes every
-  read and write, including `/stats` reads.** Under the 500-events/10s load
-  test this held up fine because each query is sub-millisecond, but it's a
-  single point of write contention — `/webhook`, the worker loop, and the
-  reconciler are all competing for the same lock. At meaningfully higher
-  throughput than this assignment's target, this would need to move off a
-  single blocking connection (`aiosqlite`, or Postgres) rather than continuing
-  to scale the lock.
+---
 
-**Fixed during testing, not shipped as a bug:** the worker's polling query
-originally selected both `pending` and `in_flight` rows as "due to send,"
-which meant an already-accepted (`202`) DM kept getting re-sent by the worker
-every poll cycle instead of being left for the reconciler to check. Caught by
-a unit test that mocked the send call and asserted call counts — a
-successful send was being called 5 times instead of 1. Fixed by scoping the
-worker's query to `status = 'pending'` only; `in_flight` rows are now only
-ever touched by the reconciler. Flagging this here because it's exactly the
-kind of duplicate-send bug this assignment is testing for, and it's better
-that you hear about it from me than find it independently.
+## 2. `comment.deleted` Arriving After DM Dispatched (`in_flight` or `delivered`)
+
+- **Exact Condition**: A user posts a keyword comment. The webhook processes `comment.created` and the worker immediately dispatches `POST /v1/dm/send`, receiving `202` (`status = 'in_flight'`). 5 seconds later, the user deletes their comment, sending a `comment.deleted` webhook event.
+- **System Behavior**: The handler queries `dm_attempts` by `comment_id`. Because the row status is `in_flight` (not `pending`), the system leaves it untouched.
+- **Why**: Instagram DMs cannot be unsent once accepted by the outbound provider. Attempting to recall or cancel an in-flight message is impossible at the protocol level.
+- **Stat Impact**: The DM will be reported under `sent` (if delivered) or `failed` (if delivery fails), rather than `cancelled`.
+
+---
+
+## 3. Persistent Downstream Outage Exceeding Retry Cap
+
+- **Exact Condition**: The downstream DM API returns `500 Internal Server Error` or encounters network timeouts continuously for 5 consecutive attempts.
+- **System Behavior**: Exponential backoff schedules retries at 2s, 4s, 8s, 16s, and 32s. Upon the 5th failure, the row transitions permanently to `status = 'failed'`.
+- **System Limitation**: If the downstream API recovers on attempt #6 (e.g. 10 minutes later), the system will not attempt another send.
+- **Stat Impact**: Accurately reported as `failed`.
+
+---
+
+## 4. In-Memory Rate Limiter Reset on Server Restart
+
+- **Exact Condition**: The server is handling heavy outbound traffic near the 10 req / 60s limit and is abruptly restarted.
+- **System Behavior**: The in-memory sliding window timestamps are cleared. Upon startup, the worker may dispatch up to 10 requests immediately.
+- **Mitigation & Risk**: If downstream rate limits are exceeded, the API returns `429` with a `Retry-After` header. The worker catches `429`, parses `Retry-After`, and reschedules `next_attempt_at` safely without losing data or failing the send.
+
+---
+
+## 5. Webhook Delivery Failure Prior to Backend Ingestion
+
+- **Exact Condition**: The upstream comment-event producer experiences a network failure or DNS resolution error before the HTTP request reaches `POST /webhook`.
+- **System Behavior**: The event never reaches the service and is not recorded in SQLite.
+- **Stat Impact**: The event is uncounted. `/stats` reflects server-side truth of ingested events only.

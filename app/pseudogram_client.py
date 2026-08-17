@@ -1,48 +1,65 @@
 import os
 import httpx
+from typing import Dict, Any, Tuple, Optional
 
-def _get_config() -> tuple[str, str]:
-    base_url = os.environ.get("PSEUDOGRAM_BASE_URL", "https://pseudogram-api.onrender.com")
-    api_key = os.environ.get("PSEUDOGRAM_API_KEY", "")
-    return base_url, api_key
+BASE_URL = os.getenv("PSEUDOGRAM_API_URL", "https://pseudogram-api.onrender.com")
 
 
-class RateLimited(Exception):
-    def __init__(self, retry_after: float):
-        self.retry_after = retry_after
+class PseudogramClient:
+    def __init__(self, base_url: str = BASE_URL):
+        self.base_url = base_url.rstrip("/")
 
+    async def send_dm(
+        self,
+        recipient_user_id: str,
+        message: str,
+        comment_id: str,
+        user_id: str,
+        rule_id: str
+    ) -> Tuple[int, Dict[str, Any], Optional[int]]:
+        """
+        Sends outbound DM request to /v1/dm/send with deterministic Idempotency-Key: f"{user_id}:{rule_id}".
+        Returns (status_code, response_json, retry_after_seconds).
+        """
+        url = f"{self.base_url}/v1/dm/send"
+        idempotency_key = f"{user_id}:{rule_id}"
+        headers = {"Idempotency-Key": idempotency_key}
+        payload = {
+            "recipient_user_id": recipient_user_id,
+            "message": message,
+            "comment_id": comment_id
+        }
 
-class TransientError(Exception):
-    pass
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            status_code = resp.status_code
 
+            retry_after = None
+            if status_code == 429:
+                raw_retry = resp.headers.get("Retry-After")
+                if raw_retry and raw_retry.isdigit():
+                    retry_after = int(raw_retry)
 
-class PermanentError(Exception):
-    pass
+            data = {}
+            if resp.content:
+                try:
+                    data = resp.json()
+                except Exception:
+                    pass
 
+            return status_code, data, retry_after
 
-async def send_dm(recipient_user_id: str, message: str, comment_id: str, idempotency_key: str) -> dict:
-    base_url, api_key = _get_config()
-    async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as client:
-        response = await client.post(
-            "/v1/dm/send",
-            json={"recipient_user_id": recipient_user_id, "message": message, "comment_id": comment_id},
-            headers={"X-API-Key": api_key, "Idempotency-Key": idempotency_key},
-        )
-    if response.status_code == 202:
-        return response.json()
-    if response.status_code == 429:
-        retry_after = float(response.headers.get("Retry-After", "5"))
-        raise RateLimited(retry_after)
-    if response.status_code == 500:
-        raise TransientError(response.text)
-    if response.status_code == 400:
-        raise PermanentError(response.text)
-    raise TransientError(f"unexpected status {response.status_code}: {response.text}")
-
-
-async def get_dm_status(dm_id: str) -> dict:
-    base_url, api_key = _get_config()
-    async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as client:
-        response = await client.get(f"/v1/dm/{dm_id}", headers={"X-API-Key": api_key})
-    response.raise_for_status()
-    return response.json()
+    async def get_dm_status(self, dm_id: str) -> Tuple[int, Dict[str, Any]]:
+        """
+        Polls GET /v1/dm/{dm_id} for async delivery resolution.
+        """
+        url = f"{self.base_url}/v1/dm/{dm_id}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            data = {}
+            if resp.content:
+                try:
+                    data = resp.json()
+                except Exception:
+                    pass
+            return resp.status_code, data

@@ -1,229 +1,294 @@
-import os
 import sqlite3
 import asyncio
+import threading
+import os
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+from typing import List, Dict, Any, Optional
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS rules (
-    id TEXT PRIMARY KEY,
-    keyword TEXT NOT NULL,
-    dm_message TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS dm_attempts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    rule_id TEXT NOT NULL,
-    comment_id TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    dm_id TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT NOT NULL,
-    last_error TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (user_id, rule_id)
-);
-
-CREATE TABLE IF NOT EXISTS dedup_blocked_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    rule_id TEXT NOT NULL,
-    blocked_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_attempts_status ON dm_attempts(status, next_attempt_at);
-CREATE INDEX IF NOT EXISTS idx_attempts_comment ON dm_attempts(comment_id);
-"""
-
-# sqlite3 is blocking, but at this scale (500 events/10s, sub-ms per query) a single
-# connection guarded by one lock is simpler and fast enough — no real reason to reach
-# for aiosqlite or a connection pool for a service this size.
-_conn: Optional[sqlite3.Connection] = None
-_lock = asyncio.Lock()
+def get_db_path() -> str:
+    return os.getenv("DB_PATH", "app.db")
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_db_lock = threading.Lock()
 
 
-def init_db() -> None:
-    global _conn
-    db_path = os.environ.get("DB_PATH", str(Path(__file__).parent.parent / "linkplease.db"))
-    _conn = sqlite3.connect(db_path, check_same_thread=False)
-    _conn.execute("PRAGMA journal_mode=WAL")
-    _conn.execute("PRAGMA foreign_keys=ON")
-    _conn.executescript(SCHEMA)
-    _conn.commit()
+def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+    if db_path is None:
+        db_path = get_db_path()
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
 
 
-def _get_conn() -> sqlite3.Connection:
-    if _conn is None:
-        raise RuntimeError("init_db() must be called before use")
-    return _conn
+def init_db(db_path: Optional[str] = None) -> None:
+    if db_path is None:
+        db_path = get_db_path()
+    with get_connection(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS rules (
+                rule_id TEXT PRIMARY KEY,
+                keyword TEXT NOT NULL,
+                dm_message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS dm_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id TEXT UNIQUE NOT NULL,
+                user_id TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                comment_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL,
+                dm_id TEXT,
+                attempt_count INTEGER DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CONSTRAINT unq_user_rule UNIQUE (user_id, rule_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS stats_counters (
+                key TEXT PRIMARY KEY,
+                value INTEGER DEFAULT 0
+            );
+
+            INSERT OR IGNORE INTO stats_counters (key, value) VALUES ('duplicates_blocked', 0);
+        """)
 
 
-async def insert_rule(rule_id: str, keyword: str, dm_message: str) -> None:
-    async with _lock:
-        _get_conn().execute(
-            "INSERT INTO rules (id, keyword, dm_message, created_at) VALUES (?, ?, ?, ?)",
-            (rule_id, keyword, dm_message, now_iso()),
-        )
-        _get_conn().commit()
-
-
-async def fetch_all_rules() -> list[sqlite3.Row]:
-    async with _lock:
-        conn = _get_conn()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT id, keyword, dm_message FROM rules").fetchall()
-        conn.row_factory = None
-        return rows
-
-
-async def insert_dm_attempt(user_id: str, rule_id: str, comment_id: str) -> bool:
-    """Atomically claim (user_id, rule_id). Returns True if this call won the race
-    and a row was created, False if a matching attempt already existed — the caller
-    should NOT send a DM in that case, and should log it as a blocked duplicate.
-
-    This is the whole dedup mechanism: the UNIQUE(user_id, rule_id) constraint plus
-    ON CONFLICT DO NOTHING means two concurrently-redelivered webhook events racing
-    to insert the same pair can never both succeed. SQLite serializes writers, so
-    exactly one INSERT commits — there's no read-then-write gap for a second event
-    to land in, unlike a SELECT-then-INSERT check.
-    """
-    idempotency_key = f"{user_id}:{rule_id}"
-    timestamp = now_iso()
-    async with _lock:
-        conn = _get_conn()
-        cursor = conn.execute(
-            """
-            INSERT INTO dm_attempts
-                (user_id, rule_id, comment_id, idempotency_key, status,
-                 attempt_count, next_attempt_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-            ON CONFLICT (user_id, rule_id) DO NOTHING
-            """,
-            (user_id, rule_id, comment_id, idempotency_key, timestamp, timestamp, timestamp),
-        )
-        won = cursor.rowcount == 1
-        if not won:
+def _insert_rule_sync(rule_id: str, keyword: str, dm_message: str, created_at: str, db_path: str) -> Dict[str, str]:
+    with _db_lock:
+        with get_connection(db_path) as conn:
             conn.execute(
-                "INSERT INTO dedup_blocked_log (user_id, rule_id, blocked_at) VALUES (?, ?, ?)",
-                (user_id, rule_id, timestamp),
+                "INSERT INTO rules (rule_id, keyword, dm_message, created_at) VALUES (?, ?, ?, ?)",
+                (rule_id, keyword, dm_message, created_at)
             )
-        conn.commit()
-        return won
+            conn.commit()
+    return {"rule_id": rule_id, "keyword": keyword, "dm_message": dm_message}
 
 
-async def cancel_pending_by_comment(comment_id: str) -> int:
-    async with _lock:
-        conn = _get_conn()
-        cursor = conn.execute(
-            "UPDATE dm_attempts SET status = 'cancelled', updated_at = ? "
-            "WHERE comment_id = ? AND status = 'pending'",
-            (now_iso(), comment_id),
-        )
-        conn.commit()
-        return cursor.rowcount
+async def insert_rule(rule_id: str, keyword: str, dm_message: str, db_path: Optional[str] = None) -> Dict[str, str]:
+    if db_path is None:
+        db_path = get_db_path()
+    created_at = datetime.now(timezone.utc).isoformat()
+    return await asyncio.to_thread(_insert_rule_sync, rule_id, keyword, dm_message, created_at, db_path)
 
 
-async def fetch_due_attempts(limit: int) -> list[sqlite3.Row]:
-    async with _lock:
-        conn = _get_conn()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
+def _get_all_rules_sync(db_path: str) -> List[sqlite3.Row]:
+    with get_connection(db_path) as conn:
+        return conn.execute("SELECT rule_id, keyword, dm_message FROM rules").fetchall()
+
+
+async def get_all_rules(db_path: Optional[str] = None) -> List[sqlite3.Row]:
+    if db_path is None:
+        db_path = get_db_path()
+    return await asyncio.to_thread(_get_all_rules_sync, db_path)
+
+
+def _record_event_and_dedup_sync(
+    user_id: str,
+    rule_id: str,
+    comment_id: str,
+    message: str,
+    attempt_id: str,
+    now_iso: str,
+    db_path: str
+) -> bool:
+    """
+    Inserts a pending DM attempt. SQLite handles concurrency safely via the UNIQUE(user_id, rule_id)
+    constraint. If the insertion fails due to conflict, atomic increment of duplicates_blocked runs.
+    """
+    with _db_lock:
+        with get_connection(db_path) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO dm_attempts (
+                    attempt_id, user_id, rule_id, comment_id, message, status, attempt_count, next_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                ON CONFLICT(user_id, rule_id) DO NOTHING;
+                """,
+                (attempt_id, user_id, rule_id, comment_id, message, now_iso, now_iso, now_iso)
+            )
+            if cursor.rowcount == 0:
+                conn.execute(
+                    "UPDATE stats_counters SET value = value + 1 WHERE key = 'duplicates_blocked'"
+                )
+                conn.commit()
+                return False
+            conn.commit()
+            return True
+
+
+async def record_event_and_dedup(
+    user_id: str,
+    rule_id: str,
+    comment_id: str,
+    message: str,
+    attempt_id: str,
+    db_path: Optional[str] = None
+) -> bool:
+    if db_path is None:
+        db_path = get_db_path()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return await asyncio.to_thread(
+        _record_event_and_dedup_sync, user_id, rule_id, comment_id, message, attempt_id, now_iso, db_path
+    )
+
+
+def _cancel_pending_attempt_sync(comment_id: str, now_iso: str, db_path: str) -> int:
+    with _db_lock:
+        with get_connection(db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE dm_attempts SET status = 'cancelled', updated_at = ? WHERE comment_id = ? AND status = 'pending'",
+                (now_iso, comment_id)
+            )
+            conn.commit()
+            return cursor.rowcount
+
+
+async def cancel_pending_attempt(comment_id: str, db_path: Optional[str] = None) -> int:
+    if db_path is None:
+        db_path = get_db_path()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return await asyncio.to_thread(_cancel_pending_attempt_sync, comment_id, now_iso, db_path)
+
+
+def _get_stats_sync(db_path: str) -> Dict[str, int]:
+    with get_connection(db_path) as conn:
+        status_rows = conn.execute(
+            "SELECT status, COUNT(*) as cnt FROM dm_attempts GROUP BY status"
+        ).fetchall()
+        status_counts = {row["status"]: row["cnt"] for row in status_rows}
+
+        counter_row = conn.execute(
+            "SELECT value FROM stats_counters WHERE key = 'duplicates_blocked'"
+        ).fetchone()
+        duplicates_blocked = counter_row["value"] if counter_row else 0
+
+    sent = status_counts.get("delivered", 0)
+    failed = status_counts.get("failed", 0) + status_counts.get("cancelled", 0)
+    queued = status_counts.get("pending", 0) + status_counts.get("in_flight", 0)
+
+    return {
+        "sent": sent,
+        "failed": failed,
+        "queued": queued,
+        "duplicates_blocked": duplicates_blocked
+    }
+
+
+async def get_stats(db_path: Optional[str] = None) -> Dict[str, int]:
+    if db_path is None:
+        db_path = get_db_path()
+    return await asyncio.to_thread(_get_stats_sync, db_path)
+
+
+def _fetch_pending_attempts_sync(now_iso: str, limit: int, db_path: str) -> List[sqlite3.Row]:
+    with get_connection(db_path) as conn:
+        return conn.execute(
             """
-            SELECT id, user_id, rule_id, comment_id, idempotency_key, attempt_count, dm_id
+            SELECT attempt_id, user_id, rule_id, comment_id, message, attempt_count
             FROM dm_attempts
             WHERE status = 'pending' AND next_attempt_at <= ?
-            ORDER BY created_at
+            ORDER BY next_attempt_at ASC
             LIMIT ?
             """,
-            (now_iso(), limit),
+            (now_iso, limit)
         ).fetchall()
-        conn.row_factory = None
-        return rows
 
 
-async def mark_in_flight(attempt_id: int, dm_id: str) -> None:
-    async with _lock:
-        conn = _get_conn()
-        conn.execute(
-            "UPDATE dm_attempts SET status = 'in_flight', dm_id = ?, attempt_count = attempt_count + 1, "
-            "updated_at = ? WHERE id = ?",
-            (dm_id, now_iso(), attempt_id),
-        )
-        conn.commit()
+async def fetch_pending_attempts(now_iso: str, limit: int = 10, db_path: Optional[str] = None) -> List[sqlite3.Row]:
+    if db_path is None:
+        db_path = get_db_path()
+    return await asyncio.to_thread(_fetch_pending_attempts_sync, now_iso, limit, db_path)
 
 
-async def mark_delivered(attempt_id: int) -> None:
-    async with _lock:
-        conn = _get_conn()
-        conn.execute(
-            "UPDATE dm_attempts SET status = 'delivered', updated_at = ? WHERE id = ?",
-            (now_iso(), attempt_id),
-        )
-        conn.commit()
+def _update_attempt_in_flight_sync(attempt_id: str, dm_id: str, now_iso: str, db_path: str) -> None:
+    with _db_lock:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE dm_attempts SET status = 'in_flight', dm_id = ?, updated_at = ? WHERE attempt_id = ?",
+                (dm_id, now_iso, attempt_id)
+            )
+            conn.commit()
 
 
-async def mark_failed(attempt_id: int, error: str) -> None:
-    async with _lock:
-        conn = _get_conn()
-        conn.execute(
-            "UPDATE dm_attempts SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
-            (error, now_iso(), attempt_id),
-        )
-        conn.commit()
+async def update_attempt_in_flight(attempt_id: str, dm_id: str, db_path: Optional[str] = None) -> None:
+    if db_path is None:
+        db_path = get_db_path()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await asyncio.to_thread(_update_attempt_in_flight_sync, attempt_id, dm_id, now_iso, db_path)
 
 
-async def reschedule(attempt_id: int, next_attempt_at: str, error: str = "") -> None:
-    async with _lock:
-        conn = _get_conn()
-        conn.execute(
-            "UPDATE dm_attempts SET attempt_count = attempt_count + 1, next_attempt_at = ?, "
-            "last_error = ?, updated_at = ? WHERE id = ?",
-            (next_attempt_at, error, now_iso(), attempt_id),
-        )
-        conn.commit()
+def _update_attempt_retry_sync(attempt_id: str, attempt_count: int, next_attempt_at: str, now_iso: str, db_path: str) -> None:
+    with _db_lock:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE dm_attempts SET status = 'pending', attempt_count = ?, next_attempt_at = ?, updated_at = ? WHERE attempt_id = ?",
+                (attempt_count, next_attempt_at, now_iso, attempt_id)
+            )
+            conn.commit()
 
 
-async def fetch_stale_in_flight(older_than_seconds: int) -> list[sqlite3.Row]:
-    async with _lock:
-        conn = _get_conn()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
+async def update_attempt_retry(attempt_id: str, attempt_count: int, next_attempt_at: str, db_path: Optional[str] = None) -> None:
+    if db_path is None:
+        db_path = get_db_path()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await asyncio.to_thread(_update_attempt_retry_sync, attempt_id, attempt_count, next_attempt_at, now_iso, db_path)
+
+
+def _update_attempt_failed_sync(attempt_id: str, attempt_count: int, now_iso: str, db_path: str) -> None:
+    with _db_lock:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE dm_attempts SET status = 'failed', attempt_count = ?, updated_at = ? WHERE attempt_id = ?",
+                (attempt_count, now_iso, attempt_id)
+            )
+            conn.commit()
+
+
+async def update_attempt_failed(attempt_id: str, attempt_count: int, db_path: Optional[str] = None) -> None:
+    if db_path is None:
+        db_path = get_db_path()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await asyncio.to_thread(_update_attempt_failed_sync, attempt_id, attempt_count, now_iso, db_path)
+
+
+def _fetch_in_flight_attempts_sync(older_than_iso: str, limit: int, db_path: str) -> List[sqlite3.Row]:
+    with get_connection(db_path) as conn:
+        return conn.execute(
             """
-            SELECT id, dm_id, attempt_count FROM dm_attempts
-            WHERE status = 'in_flight'
-              AND updated_at <= datetime('now', ?)
-            """,
-            (f"-{older_than_seconds} seconds",),
-        ).fetchall()
-        conn.row_factory = None
-        return rows
-
-
-async def compute_stats() -> dict:
-    async with _lock:
-        conn = _get_conn()
-        row = conn.execute(
-            """
-            SELECT
-                SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS sent,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                SUM(CASE WHEN status IN ('pending', 'in_flight') THEN 1 ELSE 0 END) AS queued
+            SELECT attempt_id, dm_id, attempt_count
             FROM dm_attempts
-            """
-        ).fetchone()
-        blocked = conn.execute("SELECT COUNT(*) FROM dedup_blocked_log").fetchone()[0]
-        return {
-            "sent": row[0] or 0,
-            "failed": row[1] or 0,
-            "queued": row[2] or 0,
-            "duplicates_blocked": blocked or 0,
-        }
+            WHERE status = 'in_flight' AND updated_at <= ? AND dm_id IS NOT NULL
+            ORDER BY updated_at ASC
+            LIMIT ?
+            """,
+            (older_than_iso, limit)
+        ).fetchall()
+
+
+async def fetch_in_flight_attempts(older_than_iso: str, limit: int = 20, db_path: Optional[str] = None) -> List[sqlite3.Row]:
+    if db_path is None:
+        db_path = get_db_path()
+    return await asyncio.to_thread(_fetch_in_flight_attempts_sync, older_than_iso, limit, db_path)
+
+
+def _update_attempt_delivered_sync(attempt_id: str, now_iso: str, db_path: str) -> None:
+    with _db_lock:
+        with get_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE dm_attempts SET status = 'delivered', updated_at = ? WHERE attempt_id = ?",
+                (now_iso, attempt_id)
+            )
+            conn.commit()
+
+
+async def update_attempt_delivered(attempt_id: str, db_path: Optional[str] = None) -> None:
+    if db_path is None:
+        db_path = get_db_path()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await asyncio.to_thread(_update_attempt_delivered_sync, attempt_id, now_iso, db_path)

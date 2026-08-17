@@ -1,25 +1,59 @@
 import asyncio
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+from app.db import (
+    fetch_in_flight_attempts,
+    update_attempt_delivered,
+    update_attempt_retry,
+    update_attempt_failed,
+)
+from app.pseudogram_client import PseudogramClient
 
-from app import db
-from app.pseudogram_client import get_dm_status
-from app.worker import MAX_ATTEMPTS, _backoff_seconds, _iso_in
 
-STALE_AFTER_SECONDS = 30
-RECONCILE_INTERVAL_SECONDS = 10
+async def reconcile_in_flight_attempts(
+    client: PseudogramClient,
+    stale_seconds: float = 30.0
+):
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+    cutoff_iso = cutoff_dt.isoformat()
+
+    in_flight_rows = await fetch_in_flight_attempts(cutoff_iso, limit=20)
+    for row in in_flight_rows:
+        attempt_id = row["attempt_id"]
+        dm_id = row["dm_id"]
+        attempt_count = row["attempt_count"]
+
+        try:
+            status_code, data = await client.get_dm_status(dm_id)
+            if status_code == 200:
+                dm_status = data.get("status")
+                if dm_status == "delivered":
+                    await update_attempt_delivered(attempt_id)
+                elif dm_status == "failed":
+                    new_count = attempt_count + 1
+                    if new_count >= 5:
+                        await update_attempt_failed(attempt_id, new_count)
+                    else:
+                        backoff_sec = 2 ** new_count
+                        next_dt = datetime.now(timezone.utc) + timedelta(seconds=backoff_sec)
+                        await update_attempt_retry(attempt_id, new_count, next_dt.isoformat())
+        except Exception:
+            pass
 
 
-async def run_reconciler_loop() -> None:
+async def reconciler_loop(
+    client: Optional[PseudogramClient] = None,
+    stale_seconds: float = 30.0,
+    poll_interval: float = 5.0
+):
+    if client is None:
+        client = PseudogramClient()
+
     while True:
-        stale = await db.fetch_stale_in_flight(older_than_seconds=STALE_AFTER_SECONDS)
-        for attempt in stale:
-            status = await get_dm_status(attempt["dm_id"])
-            if status["status"] == "delivered":
-                await db.mark_delivered(attempt["id"])
-            elif status["status"] == "failed":
-                if attempt["attempt_count"] >= MAX_ATTEMPTS:
-                    await db.mark_failed(attempt["id"], "delivery failed after reconciliation, attempts exhausted")
-                else:
-                    backoff = _backoff_seconds(attempt["attempt_count"])
-                    await db.reschedule(attempt["id"], _iso_in(backoff), error="delivery failed, retrying")
-            # status == "queued" still: leave it, check again next pass
-        await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
+        try:
+            await reconcile_in_flight_attempts(client, stale_seconds=stale_seconds)
+            await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(poll_interval)
